@@ -17,10 +17,11 @@ Adjust sliders if needed
 Enable/disable overlay in real-time
 ✦ Architecture Overview
 EDID → Panel Detection → Profile Engine → Technique Selection
-                                      ↓
-                             Correction Pipeline
-                         (Gamma + Overlay Rendering)
+↓
+Correction Pipeline
+(Gamma + Overlay Rendering)
 ✦ Key Algorithms
+
 1. PPI-Normalized Bleed Visibility
 
 Higher pixel density reduces perceived bleed:
@@ -33,7 +34,7 @@ Clamped to [0.5, 1.5]
 
 Balanced composite + worst-case:
 
-severity = 0.5 * composite + 0.5 * max_metric
+severity = 0.5 _ composite + 0.5 _ max_metric
 
 Prevents catastrophic issues from being averaged out.
 
@@ -41,13 +42,11 @@ Prevents catastrophic issues from being averaged out.
 
 Correct alpha in gamma space:
 
-α = 1 − (1 − L_target)^(1/γ)
-4. Exponential Edge Falloff
+α = 1 − (1 − L_target)^(1/γ) 4. Exponential Edge Falloff
 
 Physically realistic bleed decay:
 
-I(t) = α * exp(-k * t)
-5. Color Temperature Compensation
+I(t) = α _ exp(-k _ t) 5. Color Temperature Compensation
 Converts Kelvin bias → RGB gamma offsets
 Uses:
 CIE XYZ transform
@@ -95,12 +94,11 @@ Anyone bothered by uneven panels
 
 If you’ve ever noticed glow in the corners during dark scenes — this is for you.
 
-
 ---
 
 # 📄 `docs.md`
 
-```markdown
+````markdown
 # LuminaFix — Technical Documentation
 
 ---
@@ -122,10 +120,10 @@ LuminaFix is a hybrid system combining:
 
 Source:
 
-/sys/class/drm/*/edid
-
+/sys/class/drm/\*/edid
 
 Extracted fields:
+
 - Manufacturer code (3-char)
 - Product ID
 - Resolution
@@ -138,9 +136,11 @@ Extracted fields:
 ## 2.2 xrandr Reconciliation
 
 Problem:
+
 - Kernel names ≠ xrandr names
 
 Solution:
+
 - Normalize identifiers
 - Apply fuzzy matching
 - Resolve variants:
@@ -294,3 +294,5 @@ heuristic tweaking
 into:
 
 modeled, perceptual, physics-aligned correction
+```
+````
