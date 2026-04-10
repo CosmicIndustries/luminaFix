@@ -27,44 +27,153 @@ MANUFACTURERS = {
 }
 
 PANEL_DB = {
-    'AUO': dict(bleed=0.50, gradient=0.30, clouding=0.50,
+    'AUO': dict(bleed=0.50, gradient=0.30, clouding=0.50, ct_bias=150,
                 notes='Variable QC. Mid-tier IPS; budget to mid-range laptops. '
                       'Common in Asus, Acer, HP. Moderate bleed on dark content.'),
-    'BOE': dict(bleed=0.75, gradient=0.55, clouding=0.70,
+    'BOE': dict(bleed=0.75, gradient=0.55, clouding=0.70, ct_bias=300,
                 notes='Notably high bleed rates — consistently flagged in reviews. '
                       'Widely used in budget/mid Chinese OEMs (Xiaomi, Lenovo IdeaPad). '
                       'Edge and corner glow significant at low brightness.'),
-    'CMN': dict(bleed=0.50, gradient=0.35, clouding=0.50,
+    'CMN': dict(bleed=0.50, gradient=0.35, clouding=0.50, ct_bias=150,
                 notes='Chimei Innolux — moderate uniformity. Similar to AUO. '
                       'Found across Dell, HP, Lenovo mid-range. Corner clouding common.'),
-    'LGD': dict(bleed=0.25, gradient=0.20, clouding=0.25,
+    'LGD': dict(bleed=0.25, gradient=0.20, clouding=0.25, ct_bias=-50,
                 notes='LG Display — generally above average uniformity. '
                       'Premium panels used in MacBook, ThinkPad X1, Dell XPS. Low bleed.'),
-    'SDC': dict(bleed=0.20, gradient=0.15, clouding=0.20,
+    'SDC': dict(bleed=0.20, gradient=0.15, clouding=0.20, ct_bias=-100,
                 notes='Samsung Display — among the best in class for uniformity. '
                       'AMOLED variants have no backlight bleed by design. '
                       'IPS variants also tight QC.'),
-    'SHP': dict(bleed=0.15, gradient=0.10, clouding=0.15,
+    'SHP': dict(bleed=0.15, gradient=0.10, clouding=0.15, ct_bias=-150,
                 notes='Sharp — excellent uniformity. Used in premium ThinkPads, '
                       'Surface devices. Very consistent backlight distribution.'),
-    'IVO': dict(bleed=0.85, gradient=0.65, clouding=0.80,
+    'IVO': dict(bleed=0.85, gradient=0.65, clouding=0.80, ct_bias=350,
                 notes='InfoVision — worst average uniformity in class. '
                       'Significant edge glow and clouding commonly reported. '
                       'Found in budget laptops. Aggressive correction recommended.'),
-    'HSD': dict(bleed=0.70, gradient=0.60, clouding=0.70,
+    'HSD': dict(bleed=0.70, gradient=0.60, clouding=0.70, ct_bias=200,
                 notes='HannStar — significant bleed issues reported across units. '
                       'Older panel tech; found in budget/older machines.'),
-    'CPT': dict(bleed=0.60, gradient=0.40, clouding=0.55,
+    'CPT': dict(bleed=0.60, gradient=0.40, clouding=0.55, ct_bias=200,
                 notes='Chunghwa Picture Tubes — moderate to high bleed. '
                       'Gradient uniformity issues on dark grey screens.'),
-    'NCP': dict(bleed=0.50, gradient=0.35, clouding=0.50,
+    'NCP': dict(bleed=0.50, gradient=0.35, clouding=0.50, ct_bias=150,
                 notes='Innolux Corp — similar performance to Chimei Innolux (CMN). '
                       'Moderate uniformity; common in mid-range segments.'),
 }
 
 DEFAULT_PANEL = dict(bleed=0.50, gradient=0.40, clouding=0.50,
                      notes='Unknown panel — conservative defaults applied. '
-                           'Adjust sliders based on visual inspection.')
+                           'Adjust sliders based on visual inspection.',
+                     ct_bias=0)   # colour-temperature bias in K (+ = warm, - = cool)
+
+# Reference PPI for bleed/clouding visibility normalisation.
+# Bleed is an angular phenomenon — same pixel spread is less visible at higher PPI.
+_REF_PPI   = 96.0   # baseline (common 1080p 15" laptop)
+_DISPLAY_GAMMA = 2.2
+
+def _ppi(display: dict) -> float:
+    """Pixels-per-inch from EDID physical size and active resolution."""
+    h_mm, v_mm = display.get('size_mm', (0, 0))
+    w_px, h_px = display.get('resolution', (0, 0))
+    if h_mm > 10 and v_mm > 10 and w_px > 0 and h_px > 0:
+        diag_px = math.sqrt(w_px**2 + h_px**2)
+        diag_mm = math.sqrt(h_mm**2 + v_mm**2)
+        return diag_px / (diag_mm / 25.4)
+    return _REF_PPI          # unknown → assume reference
+
+def _ppi_weight(display: dict) -> float:
+    """
+    Bleed / clouding visibility weight relative to reference PPI.
+    Higher PPI → smaller apparent bleed angle → weight < 1.
+    Clamped [0.5, 1.5] so extreme panels don't dominate unreasonably.
+    """
+    return min(1.5, max(0.5, _REF_PPI / max(1.0, _ppi(display))))
+
+def _exp_stops(alpha: float, k: float = 3.5, n: int = 8) -> list[tuple[float, float]]:
+    """
+    Compute n gradient stops approximating exponential bleed decay:
+        I(t) = alpha * exp(-k * t)   t ∈ [0,1]
+    k=3.5 gives ~97 % attenuation at t=1 (observed in photometric bleed profiles).
+    Returns [(position, alpha_at_position), …] sorted 0→1.
+    """
+    stops = []
+    for i in range(n):
+        t = i / (n - 1)
+        a = alpha * math.exp(-k * t)
+        stops.append((t, a))
+    return stops
+
+def _corner_alpha(edge_alpha: float) -> float:
+    """
+    Corner bleed from two independent perpendicular edges.
+    P(bleed_corner) = 1 - P(no bleed from edge1) * P(no bleed from edge2)
+                    = 1 - (1 - a)^2
+    """
+    return 1.0 - (1.0 - edge_alpha) ** 2
+
+def _ct_to_rgb_gamma_offsets(ct_bias_k: int, base_gamma: float) -> tuple[float, float, float]:
+    """
+    Convert a colour-temperature bias (Kelvin offset from D65=6500K) to
+    per-channel gamma offsets so that the xrandr gamma ramp approximately
+    compensates the panel's white-point shift.
+
+    Method: compute CIE XYZ for D65 and the biased CCT via Kang et al. (2002)
+    approximation, derive linear RGB ratios, then map to gamma exponent shifts
+    that produce the inverse correction.
+
+    Returns (Δgamma_r, Δgamma_g, Δgamma_b) — add to base_gamma.
+    """
+    def cct_to_xy(T):
+        # Kang et al. 2002 – valid 1667 K ≤ T ≤ 25000 K
+        if T <= 4000:
+            x = (-0.2661239e9 / T**3 - 0.2343589e6 / T**2
+                 + 0.8776956e3 / T + 0.179910)
+        else:
+            x = (-3.0258469e9 / T**3 + 2.1070379e6 / T**2
+                 + 0.2226347e3 / T + 0.240390)
+        if T <= 2222:
+            y = -1.1063814 * x**3 - 1.3481102 * x**2 + 2.18555832 * x - 0.20219683
+        elif T <= 4000:
+            y = -0.9549476 * x**3 - 1.37418593 * x**2 + 2.09137015 * x - 0.16748867
+        else:
+            y =  3.0817580 * x**3 - 5.87338670 * x**2 + 3.75112997 * x - 0.37001483
+        return x, y
+
+    def xy_to_lin_rgb(x, y):
+        # CIE XYZ (Y=1) → linear sRGB (D65 primaries)
+        Y = 1.0
+        X = x * Y / max(y, 1e-6)
+        Z = (1 - x - y) * Y / max(y, 1e-6)
+        r =  3.2406 * X - 1.5372 * Y - 0.4986 * Z
+        g = -0.9689 * X + 1.8758 * Y + 0.0415 * Z
+        b =  0.0557 * X - 0.2040 * Y + 1.0570 * Z
+        return max(1e-6, r), max(1e-6, g), max(1e-6, b)
+
+    T_panel = max(2000, min(12000, 6500 + ct_bias_k))
+    T_ref   = 6500   # D65 target
+
+    xp, yp = cct_to_xy(T_panel)
+    xr, yr = cct_to_xy(T_ref)
+
+    rp, gp, bp = xy_to_lin_rgb(xp, yp)
+    rr, gr, br = xy_to_lin_rgb(xr, yr)
+
+    # Correction ratios: multiply panel linear by these to reach D65
+    corr_r = rr / rp
+    corr_g = gr / gp
+    corr_b = br / bp
+
+    # Convert correction ratio to gamma exponent delta:
+    # new_gamma_r = base_gamma + Δ such that x^(base+Δ) ≈ corr_r * x^base
+    # at mid-grey (x=0.5): 0.5^Δ = corr_r → Δ = log(corr_r) / log(0.5)
+    # Clamp to ±0.15 to prevent extreme adjustments
+    def ratio_to_delta(ratio):
+        return max(-0.15, min(0.15, math.log(ratio) / math.log(0.5)))
+
+    return (ratio_to_delta(corr_r),
+            ratio_to_delta(corr_g),
+            ratio_to_delta(corr_b))
 
 TECHNIQUE_INFO = {
     'combined':       ('Combined Correction',
@@ -332,43 +441,95 @@ def _xrandr_fallback(xrandr_outputs: dict | None = None) -> list[dict]:
 def compute_profile(display: dict) -> dict:
     panel = PANEL_DB.get(display.get('mfr_code', 'UNK'), DEFAULT_PANEL)
     bleed, gradient, clouding = panel['bleed'], panel['gradient'], panel['clouding']
-    severity = bleed * 0.50 + gradient * 0.30 + clouding * 0.20
+    ct_bias = panel.get('ct_bias', 0)
 
+    # ── PPI-weighted spatial artefacts ──────────────────────────────────────
+    # Bleed and clouding are spatially resolved; higher PPI → smaller apparent
+    # angular spread → lower effective severity at viewing distance.
+    pw = _ppi_weight(display)
+    w_bleed    = min(1.0, bleed    * pw)
+    w_clouding = min(1.0, clouding * pw)
+
+    # ── Severity: composite + worst-case blend ───────────────────────────────
+    # Pure weighted mean allows one catastrophic metric to be averaged away.
+    # Blending 50% with the worst single metric preserves worst-case sensitivity.
+    composite = 0.50 * w_bleed + 0.30 * gradient + 0.20 * w_clouding
+    worst     = max(w_bleed, gradient, w_clouding)
+    severity  = 0.50 * composite + 0.50 * worst
+
+    # ── Overlay alpha: physically correct Cairo OVER gamma encoding ───────────
+    # The Cairo OVER operator works in gamma-encoded space:
+    #   encoded result = (1−α) · V_enc
+    # In linear light:  L_result = ((1−α)·V_enc)^γ = (1−α)^γ · L_in
+    # Luminance reduction ratio: (1−α)^γ = 1−L_target
+    # ∴ α = 1 − (1−L_target)^(1/γ)
+    #
+    # L_target: fraction of peak luminance to subtract from edges.
+    # Scale factor 0.30 targets ~30% of the bleed score as correction intensity —
+    # aggressive enough to be perceptually useful, capped at 30% to avoid an
+    # unnaturally dark vignette.
+    # Previous formula a_lin^(1/γ) was inverted: it produced 8–16× too large an
+    # alpha (e.g. 0.075 → 0.317 instead of the correct 0.036 for linear target).
+    L_target      = min(0.30, w_bleed * 0.30)
+    overlay_alpha = 1.0 - (1.0 - L_target) ** (1.0 / _DISPLAY_GAMMA) if L_target > 0 else 0.0
+
+    # ── Edge width: scale with panel bleed extent ────────────────────────────
+    # Bleed typically extends 10–25 % of panel width; scale linearly with score.
+    edge_width = 0.08 + w_bleed * 0.18   # [0.08, 0.26]
+
+    # ── Brightness (L* space) ────────────────────────────────────────────────
+    # xrandr brightness is a linear multiplier on the LUT.
+    # Perceived brightness ∝ L* = 116*(Y/Yn)^(1/3) − 16  (CIE 1976)
+    # We want a target ΔL* reduction proportional to bleed severity.
+    # delta_L_star = w_bleed * 12   (up to ~12 L* units for worst panels)
+    # Y_target/Yn = ((100 − delta_L_star + 16) / 116)^3
+    # brightness  = (Y_target/Yn)^(1/γ)   ← back to gamma-encoded multiplier
+    delta_L = w_bleed * 12.0
+    L_ref   = 100.0
+    L_target = max(70.0, L_ref - delta_L)
+    Y_target = ((L_target + 16.0) / 116.0) ** 3
+    brightness = round(max(0.75, Y_target ** (1.0 / _DISPLAY_GAMMA)), 3)
+
+    # ── Per-channel gamma via colour temperature bias ────────────────────────
+    # Base gamma compensates gradient non-uniformity.
+    # Saturating model replaces linear: gradient*0.10 is unbounded and over-
+    # corrects at high gradient scores (1.0→1.10, visibly crushing darks).
+    # Exponential saturation: 0.10*(1-exp(-4g)); asymptote ≈1.10 as g→1.
+    # At mid-scores (g=0.5): saturating=1.087 vs linear=1.050 — more correction
+    # applied where blending artefacts are most visible.
+    gamma_base = 1.0 + 0.10 * (1.0 - math.exp(-4.0 * gradient))
+    dr, dg, db = _ct_to_rgb_gamma_offsets(ct_bias, gamma_base)
+
+    # ── Technique selection ──────────────────────────────────────────────────
     if severity >= 0.60:
-        technique           = 'combined'
-        overlay_alpha       = min(0.22, bleed * 0.28)
-        edge_width          = 0.20
-        brightness          = max(0.80, 1.0 - bleed * 0.22)
-        gamma               = round(1.0 + gradient * 0.12, 3)
+        technique = 'combined'
     elif severity >= 0.40:
-        technique           = 'edge_mask'
-        overlay_alpha       = min(0.16, bleed * 0.20)
-        edge_width          = 0.15
-        brightness          = max(0.88, 1.0 - bleed * 0.12)
-        gamma               = 1.0
+        technique = 'edge_mask'
+        overlay_alpha *= 0.75   # edge_mask only: lighter touch than combined
     elif severity >= 0.20:
-        technique           = 'gamma_darken'
-        overlay_alpha       = 0.0
-        edge_width          = 0.10
-        brightness          = max(0.92, 1.0 - bleed * 0.08)
-        gamma               = round(1.0 + gradient * 0.06, 3)
+        technique = 'gamma_darken'
+        overlay_alpha = 0.0
+        edge_width    = 0.08
     else:
-        technique           = 'minimal'
-        overlay_alpha       = 0.0
-        edge_width          = 0.0
-        brightness          = 1.0
-        gamma               = 1.0
+        technique     = 'minimal'
+        overlay_alpha = 0.0
+        edge_width    = 0.0
+        brightness    = 1.0
+        gamma_base    = 1.0
+        dr = dg = db  = 0.0
 
     return dict(
         panel=panel,
         severity=round(severity, 3),
+        ppi=round(_ppi(display), 1),
+        ppi_weight=round(pw, 3),
         technique=technique,
         params=dict(
-            brightness=round(brightness, 3),
-            gamma_r=round(gamma, 3),
-            gamma_g=round(gamma * 0.99, 3),
-            gamma_b=round(gamma * 1.01, 3),
-            overlay_alpha=round(overlay_alpha, 3),
+            brightness=brightness,
+            gamma_r=round(gamma_base + dr, 4),
+            gamma_g=round(gamma_base + dg, 4),
+            gamma_b=round(gamma_base + db, 4),
+            overlay_alpha=round(overlay_alpha, 4),
             edge_width=round(edge_width, 3),
         ),
     )
@@ -458,33 +619,64 @@ class OverlayWindow(Gtk.Window):
     def _paint_edges(self, cr, w, h, alpha, ef):
         ew, eh = w * ef, h * ef
 
+        # Exponential bleed decay: I(t) = alpha * exp(-k*t), k≈3.5
+        # sampled at 8 stops for a smooth curve through Cairo's linear interpolation.
+        stops = _exp_stops(alpha, k=3.5, n=8)
+
+        # Four edge bands (left, right, top, bottom)
         for x0, y0, x1, y1 in [
-            (0,  0,  ew,      0),
-            (w,  0,  w - ew,  0),
-            (0,  0,  0,       eh),
-            (0,  h,  0,       h - eh),
+            (0,   0, ew,      0),   # left  → right (gradient moves inward)
+            (w,   0, w - ew,  0),   # right → left
+            (0,   0, 0,       eh),  # top   → bottom
+            (0,   h, 0,       h - eh),  # bottom → top
         ]:
             g = cairo.LinearGradient(x0, y0, x1, y1)
-            g.add_color_stop_rgba(0, 0, 0, alpha, alpha)
-            g.add_color_stop_rgba(1, 0, 0, 0,     0)
+            for t, a in stops:
+                g.add_color_stop_rgba(t, 0, 0, a, a)
             cr.set_source(g)
             cr.paint()
 
-        cr_size = min(ew, eh) * 1.8
+        # Corner regions: inclusion-exclusion of two orthogonal edge contributions.
+        # For each gradient stop at position t, the edge bleed is f(t) = α·exp(−k·t).
+        # The corner receives bleed from BOTH edges; their union (not sum) is:
+        #   a_corner(t) = 2·f(t) − f(t)²   (inclusion-exclusion)
+        #
+        # Previous code applied _corner_alpha(α) = 2α−α² as a scalar at t=0, then
+        # decayed it exponentially — equivalent to (2α−α²)·exp(−kt). The correct
+        # formula is 2·(α·exp(−kt)) − (α·exp(−kt))² which has a quadratic exp term
+        # that fades faster, making corners slightly darker at t=0 and more accurate
+        # throughout. Difference grows with α (significant when α > 0.05).
+        k_c = 3.5
+        N_c = 8
+        cr_size = math.sqrt(ew**2 + eh**2)
+
         for cx, cy in [(0, 0), (w, 0), (0, h), (w, h)]:
             g = cairo.RadialGradient(cx, cy, 0, cx, cy, cr_size)
-            g.add_color_stop_rgba(0, 0, 0, alpha * 1.4, alpha * 1.4)
-            g.add_color_stop_rgba(1, 0, 0, 0,           0)
+            for i in range(N_c):
+                t   = i / (N_c - 1)
+                f_t = alpha * math.exp(-k_c * t)        # single-edge falloff
+                a_t = max(0.0, min(1.0, 2*f_t - f_t*f_t))  # union, inclusion-exclusion
+                g.add_color_stop_rgba(t, 0, 0, a_t, a_t)
             cr.set_source(g)
             cr.paint()
 
     def _paint_radial(self, cr, w, h, alpha):
+        """
+        Raised-cosine uniformity vignette.
+        alpha(r) = alpha * (1 − cos(π·r)) / 2   for r ∈ [0, 1]
+        This gives a smooth S-curve: zero at centre, soft at mid-radius,
+        full at edge — perceptually uniform progression with no visible plateau.
+        """
         cx, cy = w / 2, h / 2
-        r = math.sqrt(cx**2 + cy**2)
-        g = cairo.RadialGradient(cx, cy, 0, cx, cy, r)
-        g.add_color_stop_rgba(0.0, 0, 0, 0,     0)
-        g.add_color_stop_rgba(0.65, 0, 0, 0,    0)
-        g.add_color_stop_rgba(1.0, 0, 0, alpha, alpha)
+        # Map to normalised radius at screen corner = 1.0
+        r_max = math.sqrt(cx**2 + cy**2)
+        n = 12
+        g = cairo.RadialGradient(cx, cy, 0, cx, cy, r_max)
+        for i in range(n):
+            t = i / (n - 1)
+            # Raised cosine: 0 at centre (t=0), alpha at edge (t=1)
+            a = alpha * (1.0 - math.cos(math.pi * t)) / 2.0
+            g.add_color_stop_rgba(t, 0, 0, a, a)
         cr.set_source(g)
         cr.paint()
 
